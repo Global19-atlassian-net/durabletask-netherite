@@ -17,12 +17,12 @@ namespace DurableTask.Netherite.Faster
     using System.Collections.Generic;
     using FASTER.core;
 
-    class PsfBlobCheckpointManager : ICheckpointManager
+    class IndexBlobCheckpointManager : ICheckpointManager
     {
         readonly BlobManager blobManager;
         readonly int groupOrdinal;
 
-        internal PsfBlobCheckpointManager(BlobManager blobMan, int groupOrd)
+        internal IndexBlobCheckpointManager(BlobManager blobMan, int groupOrd)
         {
             this.blobManager = blobMan;
             this.groupOrdinal = groupOrd;

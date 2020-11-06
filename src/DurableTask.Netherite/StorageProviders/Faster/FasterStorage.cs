@@ -11,6 +11,10 @@
 //  limitations under the License.
 //  ----------------------------------------------------------------------------------
 
+#define USE_SUBSET_INDEX
+
+#pragma warning disable IDE0008 // Use explicit type
+
 namespace DurableTask.Netherite.Faster
 {
     using System;
@@ -70,10 +74,10 @@ namespace DurableTask.Netherite.Faster
             this.partition = partition;
             this.terminationToken = errorHandler.Token;
 
-#if FASTER_SUPPORTS_PSF
-            int psfCount = partition.Settings.UsePSFQueries ? FasterKV.PSFCount : 0;
+#if USE_SUBSET_INDEX
+            int groupCount = partition.Settings.UseSubsetIndexQueries ? FasterKV.IndexGroupCount : 0;
 #else
-            int psfCount = 0;
+            int groupCount = 0;
 #endif
 
             this.blobManager = new BlobManager(
@@ -84,7 +88,7 @@ namespace DurableTask.Netherite.Faster
                 this.partition.Settings.StorageLogLevelLimit, 
                 partition.PartitionId, 
                 errorHandler,
-                psfCount);
+                groupCount);
 
             this.TraceHelper = this.blobManager.TraceHelper;
 

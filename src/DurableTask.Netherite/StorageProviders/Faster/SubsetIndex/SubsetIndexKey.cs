@@ -17,36 +17,37 @@ namespace DurableTask.Netherite.Faster
     using DurableTask.Core;
     using FASTER.core;
 
-    struct PSFKey : IFasterEqualityComparer<PSFKey>
+    struct SubsetIndexKey : IFasterEqualityComparer<SubsetIndexKey>
     {
         internal static TimeSpan DateBinInterval = TimeSpan.FromMinutes(1);
+        internal static DateTime BaseDate = new DateTime(2020, 1, 1);
         internal const int InstanceIdPrefixLen = 7;
 
-        enum PsfColumn { RuntimeStatus = 101, CreatedTime, InstanceIdPrefix }
+        enum PredicateColumn { RuntimeStatus = 101, CreatedTime, InstanceIdPrefix }
 
         // Enums are not blittable
         readonly int column;
         readonly int value;
 
-        internal PSFKey(OrchestrationStatus status)
+        internal SubsetIndexKey(OrchestrationStatus status)
         {
-            this.column = (int)PsfColumn.RuntimeStatus;
+            this.column = (int)PredicateColumn.RuntimeStatus;
             this.value = (int)status;
         }
 
-        internal PSFKey(DateTime dt)
+        internal SubsetIndexKey(DateTime dt)
         {
-            this.column = (int)PsfColumn.CreatedTime;
+            this.column = (int)PredicateColumn.CreatedTime;
 
-            // Make bins of one minute, starting from the beginning of 2020; there are 527040 minutes in a leap year, 1440 in a day.
-            // If we're still using this in 1000 years I will be amazed. TODO confirm the one-minute bin interval, or make it configurable
-            var year = dt.Year - 2020;
-            this.value = (year * 1_000_000) + (dt.DayOfYear * 1440) + (dt.Hour * 60) + dt.Minute;
+            // Make bins of one minute, starting from the beginning of 2020.
+            var ticks = (dt - BaseDate).Ticks;
+            var ts = TimeSpan.FromTicks(ticks);
+            this.value = (int)Math.Floor(ts.TotalMinutes);
         }
 
-        internal PSFKey(string instanceId, int prefixLength = InstanceIdPrefixLen)    // TODO change this to pass a list of prefixFunc<string, string> and make a PSF for each? E.g. parse "@{entityName.ToLowerInvariant()}@" or "@"
+        internal SubsetIndexKey(string instanceId, int prefixLength = InstanceIdPrefixLen)    // TODO change this to pass a list of prefixFunc<string, string> and make a Predicate for each? E.g. parse "@{entityName.ToLowerInvariant()}@" or "@"
         {
-            this.column = (int)PsfColumn.InstanceIdPrefix;
+            this.column = (int)PredicateColumn.InstanceIdPrefix;
             if (instanceId.Length > prefixLength)
             {
                 instanceId = instanceId.Substring(0, Math.Min(instanceId.Length, prefixLength));
@@ -76,12 +77,17 @@ namespace DurableTask.Netherite.Faster
             }
         }
 
-        OrchestrationStatus Status => (OrchestrationStatus)this.value;
+        public bool Equals(ref SubsetIndexKey key1, ref SubsetIndexKey key2) => key1.column == key2.column && key1.value == key2.value;
 
-        public bool Equals(ref PSFKey k1, ref PSFKey k2) => k1.column == k2.column && k1.value == k2.value;
+        public long GetHashCode64(ref SubsetIndexKey key) => Utility.GetHashCode(key.column) ^ Utility.GetHashCode(key.value);
 
-        public long GetHashCode64(ref PSFKey k) => Utility.GetHashCode(this.column) ^ Utility.GetHashCode(this.value);
-
-        public override string ToString() => this.Status.ToString();
+        public override string ToString()
+            => (PredicateColumn)this.column switch
+            {
+                PredicateColumn.RuntimeStatus => $"{(PredicateColumn)this.column} = {(OrchestrationStatus)this.value}",
+                PredicateColumn.CreatedTime => $"{(PredicateColumn)this.column} = {BaseDate + TimeSpan.FromMinutes(this.value):s}",
+                PredicateColumn.InstanceIdPrefix => $"{(PredicateColumn)this.column} = {this.value}",
+                _ => "<Unknown PredicateColumn value>"
+            };
     }
 }

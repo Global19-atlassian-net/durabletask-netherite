@@ -131,9 +131,9 @@ namespace DurableTask.Netherite
         public long MaxTimeMsBetweenCheckpoints { get; set; } = 60 * 1000;
 
         /// <summary>
-        /// Whether to use the Faster PSF support for handling queries.
+        /// Whether to use the Faster Subset Index support for handling queries.
         /// </summary>
-        public bool UsePSFQueries { get; set; } = true;
+        public bool UseSubsetIndexQueries { get; set; } = true;
 
         /// <summary>
         /// Whether to use the alternate object store implementation.

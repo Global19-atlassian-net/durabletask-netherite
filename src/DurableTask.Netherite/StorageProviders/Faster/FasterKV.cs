@@ -11,6 +11,11 @@
 //  limitations under the License.
 //  ----------------------------------------------------------------------------------
 
+#define USE_SUBSET_INDEX
+
+#pragma warning disable IDE0008 // Use explicit type
+#pragma warning disable IDE0011 // Add braces
+
 namespace DurableTask.Netherite.Faster
 {
     using System;
@@ -21,6 +26,8 @@ namespace DurableTask.Netherite.Faster
     using DurableTask.Core;
     using DurableTask.Core.Common;
     using FASTER.core;
+    using FASTER.indexes.SubsetIndex;
+    using FASTER.libraries.SubsetIndex;
 
     class FasterKV : TrackedObjectStore
     {
@@ -30,17 +37,17 @@ namespace DurableTask.Netherite.Faster
         readonly BlobManager blobManager;
         readonly CancellationToken terminationToken;
 
-        ClientSession<Key, Value, EffectTracker, TrackedObject, PartitionReadEvent, Functions> mainSession;
+        ClientSessionForSI<Key, Value, EffectTracker, TrackedObject, PartitionReadEvent, Functions> mainSession;
 
         internal const long HashTableSize = 1L << 16;
 
-#if FASTER_SUPPORTS_PSF
-        // We currently place all PSFs into a single group with a single TPSFKey type
-        internal const int PSFCount = 1;
+#if USE_SUBSET_INDEX
+        // We currently place all Predicates into a single group with a single TPKey type
+        internal const int IndexGroupCount = 1;
 
-        internal IPSF RuntimeStatusPsf;
-        internal IPSF CreatedTimePsf;
-        internal IPSF InstanceIdPrefixPsf;
+        internal IPredicate RuntimeStatusPredicate;
+        internal IPredicate CreatedTimePredicate;
+        internal IPredicate InstanceIdPrefixPredicate;
 #endif
         public FasterKV(Partition partition, BlobManager blobManager)
         {
@@ -49,7 +56,7 @@ namespace DurableTask.Netherite.Faster
 
             partition.ErrorHandler.Token.ThrowIfCancellationRequested();
 
-            this.fht = new FasterKV<Key, Value>(
+            this.fht = SubsetIndexExtensions.NewFasterKV(
                 HashTableSize,
                 blobManager.StoreLogSettings(partition.Settings.UsePremiumStorage, partition.NumberPartitions()),
                 blobManager.StoreCheckpointSettings,
@@ -59,24 +66,24 @@ namespace DurableTask.Netherite.Faster
                     valueSerializer = () => new Value.Serializer(this.StoreStats),
                 });
 
-#if FASTER_SUPPORTS_PSF
-            if (partition.Settings.UsePSFQueries)
+#if USE_SUBSET_INDEX
+            if (partition.Settings.UseSubsetIndexQueries)
             {
-                int groupOrdinal = 0;
-                var psfs = fht.RegisterPSF(this.blobManager.CreatePSFRegistrationSettings<PSFKey>(partition.NumberPartitions(), groupOrdinal++),
-                                           (nameof(this.RuntimeStatusPsf), (k, v) => v.Val is InstanceState state
-                                                                                ? (PSFKey?)new PSFKey(state.OrchestrationState.OrchestrationStatus)
+                // Register all Predicates as a single group.
+                var preds = this.fht.Register(this.blobManager.CreateIndexRegistrationSettings<SubsetIndexKey>(partition.NumberPartitions(), 0),
+                                           (nameof(this.RuntimeStatusPredicate), (k, v) => v.Val is InstanceState state
+                                                                                ? (SubsetIndexKey?)new SubsetIndexKey(state.OrchestrationState.OrchestrationStatus)
                                                                                 : null),
-                                           (nameof(this.CreatedTimePsf), (k, v) => v.Val is InstanceState state
-                                                                                ? (PSFKey?)new PSFKey(state.OrchestrationState.CreatedTime)
+                                           (nameof(this.CreatedTimePredicate), (k, v) => v.Val is InstanceState state
+                                                                                ? (SubsetIndexKey?)new SubsetIndexKey(state.OrchestrationState.CreatedTime)
                                                                                 : null),
-                                           (nameof(this.InstanceIdPrefixPsf), (k, v) => v.Val is InstanceState state
-                                                                                ? (PSFKey?)new PSFKey(state.InstanceId)
+                                           (nameof(this.InstanceIdPrefixPredicate), (k, v) => v.Val is InstanceState state
+                                                                                ? (SubsetIndexKey?)new SubsetIndexKey(state.InstanceId)
                                                                                 : null));
 
-                this.RuntimeStatusPsf = psfs[0];
-                this.CreatedTimePsf = psfs[1];
-                this.InstanceIdPrefixPsf = psfs[2];
+                this.RuntimeStatusPredicate = preds[0];
+                this.CreatedTimePredicate = preds[1];
+                this.InstanceIdPrefixPredicate = preds[2];
             }
 #endif
             this.terminationToken = partition.ErrorHandler.Token;
@@ -89,7 +96,7 @@ namespace DurableTask.Netherite.Faster
                         this.fht.Dispose();
                         this.blobManager.HybridLogDevice.Dispose();
                         this.blobManager.ObjectLogDevice.Dispose();
-                        this.blobManager.ClosePSFDevices();
+                        this.blobManager.CloseIndexDevices();
                     }
                     catch(Exception e)
                     {
@@ -101,8 +108,8 @@ namespace DurableTask.Netherite.Faster
             this.blobManager.TraceHelper.FasterProgress("Constructed FasterKV");
         }
 
-        ClientSession<Key, Value, EffectTracker, TrackedObject, PartitionReadEvent, Functions> CreateASession()
-            => this.fht.NewSession<EffectTracker, TrackedObject, PartitionReadEvent, Functions>(new Functions(this.partition, this.StoreStats));
+        ClientSessionForSI<Key, Value, EffectTracker, TrackedObject, PartitionReadEvent, Functions> CreateASession()
+            => this.fht.ForSI(new Functions(this.partition, this.StoreStats)).NewSession<Functions>();
 
         public override void InitMainSession() 
             => this.mainSession = this.CreateASession();
@@ -219,30 +226,33 @@ namespace DurableTask.Netherite.Faster
             {
                 var instanceQuery = queryEvent.InstanceQuery;
 
-#if FASTER_SUPPORTS_PSF
-                IAsyncEnumerable<OrchestrationState> queryPSFsAsync(ClientSession<Key, Value, EffectTracker, TrackedObject, PartitionReadEvent, Functions> session)
+#if USE_SUBSET_INDEX
+                IAsyncEnumerable<OrchestrationState> queryAsync(ClientSessionForSI<Key, Value, EffectTracker, TrackedObject, PartitionReadEvent, Functions> session)
                 {
-                    // Issue the PSF query. Note that pending operations will be completed before this returns.
-                    var querySpec = new List<(IPSF, IEnumerable<PSFKey>)>();
+                    if (!queryEvent.InstanceQuery.IsSet)
+                        return this.ScanOrchestrationStates(session, effectTracker, instanceQuery);
+
+                    // Issue the query on the subset index. Note that pending operations will be completed before this returns.
+                    var querySpec = new List<(IPredicate, IEnumerable<SubsetIndexKey>)>();
                     if (instanceQuery.HasRuntimeStatus)
-                        querySpec.Add((this.RuntimeStatusPsf, instanceQuery.RuntimeStatus.Select(s => new PSFKey(s))));
+                        querySpec.Add((this.RuntimeStatusPredicate, instanceQuery.RuntimeStatus.Select(s => new SubsetIndexKey(s))));
                     if (instanceQuery.CreatedTimeFrom.HasValue || instanceQuery.CreatedTimeTo.HasValue)
                     {
-                        IEnumerable<PSFKey> enumerateDateBinKeys()
+                        IEnumerable<SubsetIndexKey> enumerateDateBinKeys()
                         {
                             var to = instanceQuery.CreatedTimeTo ?? DateTime.UtcNow;
                             var from = instanceQuery.CreatedTimeFrom ?? to.AddDays(-7);   // TODO Some default so we don't have to iterate from the first possible date
-                            for (var dt = from; dt <= to; dt += PSFKey.DateBinInterval)
-                                yield return new PSFKey(dt);
+                            for (var dt = from; dt <= to; dt += SubsetIndexKey.DateBinInterval)
+                                yield return new SubsetIndexKey(dt);
                         }
-                        querySpec.Add((this.CreatedTimePsf, enumerateDateBinKeys()));
+                        querySpec.Add((this.CreatedTimePredicate, enumerateDateBinKeys()));
                     }
                     if (!string.IsNullOrWhiteSpace(instanceQuery.InstanceIdPrefix))
-                        querySpec.Add((this.InstanceIdPrefixPsf, new[] { new PSFKey(instanceQuery.InstanceIdPrefix) }));
-                    var querySettings = new PSFQuerySettings
+                        querySpec.Add((this.InstanceIdPrefixPredicate, new[] { new SubsetIndexKey(instanceQuery.InstanceIdPrefix) }));
+                    var querySettings = new QuerySettings
                     {
-                        // This is a match-all-PSFs enumeration so do not continue after any PSF has hit EOS
-                        OnStreamEnded = (unusedPsf, unusedIndex) => false
+                        // This is a match-all-Predicates enumeration, so do not continue after any Predicate has hit EOS
+                        OnStreamEnded = (unusedPred, unusedIndex) => false
                     };
 
                     OrchestrationState getOrchestrationState(ref Value v)
@@ -264,22 +274,19 @@ namespace DurableTask.Netherite.Faster
                         }
                     }
 
-                    return session.QueryPSFAsync(querySpec, matches => matches.All(b => b), querySettings)
+                    return session.QueryAsync(querySpec, matches => matches.All(b => b), querySettings)
                                   .Select(providerData => getOrchestrationState(ref providerData.GetValue()))
-                                  .Where(orchestrationState => orchestrationState != null);
+                                  .Where(orchestrationState => orchestrationState != null && instanceQuery.Matches(orchestrationState));
                 }
 #else
-                IAsyncEnumerable<OrchestrationState> queryPSFsAsync(ClientSession<Key, Value, EffectTracker, TrackedObject, PartitionReadEvent, Functions> session)
+                IAsyncEnumerable<OrchestrationState> queryAsync(ClientSessionForSI<Key, Value, EffectTracker, TrackedObject, PartitionReadEvent, Functions> session)
                     => this.ScanOrchestrationStates(session, effectTracker, instanceQuery);
 #endif
                 // create a individual session for this query so the main session can be used
                 // while the query is progressing.
                 using (var session = this.CreateASession())
                 {
-                    var orchestrationStates = (this.partition.Settings.UsePSFQueries && instanceQuery.IsSet)
-                        ? queryPSFsAsync(session)
-                        : this.ScanOrchestrationStates(session, effectTracker, instanceQuery);
-
+                    var orchestrationStates = queryAsync(session);
                     await effectTracker.ProcessQueryResultAsync(queryEvent, orchestrationStates);
                 }
             }
@@ -337,7 +344,7 @@ namespace DurableTask.Netherite.Faster
         {
             try
             {
-                var result = await this.mainSession.ReadAsync(ref key, ref effectTracker, context:null, token: this.terminationToken).ConfigureAwait(false);
+                var result = await this.mainSession.ReadAsync(ref key, ref effectTracker, context:null, cancellationToken: this.terminationToken).ConfigureAwait(false);
                 var (status, output) = result.Complete();
                 return output;
             }
@@ -350,13 +357,13 @@ namespace DurableTask.Netherite.Faster
 
         // read a tracked object on a query session
         async ValueTask<TrackedObject> ReadAsync(
-            ClientSession<Key, Value, EffectTracker, TrackedObject, PartitionReadEvent, Functions> session,
+            ClientSessionForSI<Key, Value, EffectTracker, TrackedObject, PartitionReadEvent, Functions> session,
             Key key, 
             EffectTracker effectTracker)
         {
             try
             {
-                var result = await session.ReadAsync(ref key, ref effectTracker, context: null, token: this.terminationToken).ConfigureAwait(false);
+                var result = await session.ReadAsync(ref key, ref effectTracker, context: null, cancellationToken: this.terminationToken).ConfigureAwait(false);
                 var (status, output) = result.Complete();
                 return output;
             }
@@ -391,7 +398,7 @@ namespace DurableTask.Netherite.Faster
         {
             try
             {
-                (await this.mainSession.RMWAsync(ref k, ref tracker, token: this.terminationToken)).Complete();
+                (await this.mainSession.RMWAsync(ref k, ref tracker, cancellationToken: this.terminationToken)).Complete();
             }
             catch (Exception exception)
                when (this.terminationToken.IsCancellationRequested && !Utils.IsFatal(exception))
@@ -401,7 +408,7 @@ namespace DurableTask.Netherite.Faster
         }
 
         async IAsyncEnumerable<OrchestrationState> ScanOrchestrationStates(
-            ClientSession<Key, Value, EffectTracker, TrackedObject, PartitionReadEvent, Functions> session,
+            ClientSessionForSI<Key, Value, EffectTracker, TrackedObject, PartitionReadEvent, Functions> session,
             EffectTracker effectTracker,
             InstanceQuery instanceQuery)
         {
@@ -569,8 +576,9 @@ namespace DurableTask.Netherite.Faster
             }
         }
 
-        public class Functions : IFunctions<Key, Value, EffectTracker, TrackedObject, PartitionReadEvent>
+        public class Functions : IAdvancedFunctions<Key, Value, EffectTracker, TrackedObject, PartitionReadEvent>
         {
+#pragma warning disable IDE0060 // Remove unused parameter
             readonly Partition partition;
             readonly StoreStatistics stats;
 
@@ -580,7 +588,7 @@ namespace DurableTask.Netherite.Faster
                 this.stats = stats;
             }
 
-            public void InitialUpdater(ref Key key, ref EffectTracker tracker, ref Value value)
+            public void InitialUpdater(ref Key key, ref EffectTracker tracker, ref Value value, long address)
             {
                 var trackedObject = TrackedObjectKey.Factory(key.Val);
                 this.stats.Create++;
@@ -590,7 +598,7 @@ namespace DurableTask.Netherite.Faster
                 this.stats.Modify++;
             }
 
-            public bool InPlaceUpdater(ref Key key, ref EffectTracker tracker, ref Value value)
+            public bool InPlaceUpdater(ref Key key, ref EffectTracker tracker, ref Value value, long address)
             {
                 this.partition.Assert(value.Val is TrackedObject);
                 TrackedObject trackedObject = value;
@@ -603,7 +611,7 @@ namespace DurableTask.Netherite.Faster
 
             public bool NeedCopyUpdate(ref Key key, ref EffectTracker tracker, ref Value value) => true;
 
-            public void CopyUpdater(ref Key key, ref EffectTracker tracker, ref Value oldValue, ref Value newValue)
+            public void CopyUpdater(ref Key key, ref EffectTracker tracker, ref Value oldValue, ref Value newValue, long oldAddress, long newAddress)
             {
                 this.stats.Copy++;
 
@@ -622,7 +630,7 @@ namespace DurableTask.Netherite.Faster
                 this.stats.Modify++;
             }
 
-            public void SingleReader(ref Key key, ref EffectTracker _, ref Value value, ref TrackedObject dst)
+            public void SingleReader(ref Key key, ref EffectTracker _, ref Value value, ref TrackedObject dst, long address)
             {
                 var trackedObject = value.Val as TrackedObject;
                 this.partition.Assert(trackedObject != null);
@@ -631,7 +639,7 @@ namespace DurableTask.Netherite.Faster
                 this.stats.Read++;
             }
 
-            public void ConcurrentReader(ref Key key, ref EffectTracker _, ref Value value, ref TrackedObject dst)
+            public void ConcurrentReader(ref Key key, ref EffectTracker _, ref Value value, ref TrackedObject dst, long address)
             {
                 var trackedObject = value.Val as TrackedObject;
                 this.partition.Assert(trackedObject != null);
@@ -640,18 +648,18 @@ namespace DurableTask.Netherite.Faster
                 this.stats.Read++;
             }
 
-            public void SingleWriter(ref Key key, ref Value src, ref Value dst)
+            public void SingleWriter(ref Key key, ref Value src, ref Value dst, long address)
             {
                 dst.Val = src.Val;
             }
 
-            public bool ConcurrentWriter(ref Key key, ref Value src, ref Value dst)
+            public bool ConcurrentWriter(ref Key key, ref Value src, ref Value dst, long address)
             {
                 dst.Val = src.Val;
                 return true;
             }
 
-            public void ReadCompletionCallback(ref Key key, ref EffectTracker tracker, ref TrackedObject output, PartitionReadEvent evt, Status status)
+            public void ReadCompletionCallback(ref Key key, ref EffectTracker tracker, ref TrackedObject output, PartitionReadEvent evt, Status status, RecordInfo recordInfo)
             {
                 // the result is passed on to the read event
                 switch (status)

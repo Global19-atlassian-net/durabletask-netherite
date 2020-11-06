@@ -11,6 +11,8 @@
 //  limitations under the License.
 //  ----------------------------------------------------------------------------------
 
+#pragma warning disable IDE0008 // Use explicit type
+
 namespace DurableTask.Netherite.Tests
 {
     using System;
@@ -26,6 +28,7 @@ namespace DurableTask.Netherite.Tests
     using Orchestrations = DurableTask.Netherite.Tests.ScenarioTests.Orchestrations;
     using Microsoft.Extensions.Logging;
     using DurableTask.Netherite;
+    using Xunit.Sdk;
 
     // These tests are copied from AzureStorageScenarioTests
     [Collection("NetheriteTests")]
@@ -68,6 +71,16 @@ namespace DurableTask.Netherite.Tests
 
             var results = await this.host.GetAllOrchestrationInstancesAsync();
             Assert.Equal(numInstances, results.Count);
+
+            // Look up each instanceId.
+            foreach (var state1 in results)
+            {
+                var results2 = await this.host.GetOrchestrationStateAsync(InstanceIdPrefix: state1.OrchestrationInstance.InstanceId);   // SubsetIndexKey trims this to prefix len
+                Assert.Equal(1, results2.Count);
+                var state2 = results2.First();
+                Assert.Equal(state2.OrchestrationInstance.InstanceId, state1.OrchestrationInstance.InstanceId);
+            }
+
             for (var ii = 1; ii <= numInstances; ++ii)
             {
                 Assert.NotNull(results.SingleOrDefault(r => r.Output == $"\"Hello, world {ii}!\""));
@@ -83,6 +96,8 @@ namespace DurableTask.Netherite.Tests
 
             assertIsMiddleInstance(await this.host.GetOrchestrationStateAsync(CreatedTimeFrom: middleInstance.CreatedTime,
                                                                             CreatedTimeTo: middleInstance.CreatedTime.AddMilliseconds(50)));
+
+            // Verify we can still find a specific InstanceId.
             assertIsMiddleInstance(await this.host.GetOrchestrationStateAsync(InstanceIdPrefix: getPrefix(2)));
         }
 
