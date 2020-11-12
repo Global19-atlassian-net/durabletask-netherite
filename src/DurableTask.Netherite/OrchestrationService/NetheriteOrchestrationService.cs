@@ -1,15 +1,5 @@
-﻿//  ----------------------------------------------------------------------------------
-//  Copyright Microsoft Corporation. All rights reserved.
-//  Licensed under the Apache License, Version 2.0 (the "License");
-//  you may not use this file except in compliance with the License.
-//  You may obtain a copy of the License at
-//  http://www.apache.org/licenses/LICENSE-2.0
-//  Unless required by applicable law or agreed to in writing, software
-//  distributed under the License is distributed on an "AS IS" BASIS,
-//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//  See the License for the specific language governing permissions and
-//  limitations under the License.
-//  ----------------------------------------------------------------------------------
+﻿// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License. See LICENSE in the project root for license information.
 
 namespace DurableTask.Netherite
 {
@@ -40,6 +30,8 @@ namespace DurableTask.Netherite
         readonly ITaskHub taskHub;
         readonly TransportConnectionString.StorageChoices configuredStorage;
         readonly TransportConnectionString.TransportChoices configuredTransport;
+
+        readonly WorkItemTraceHelper workItemTraceHelper;
 
         /// <summary>
         /// The logger category prefix used for all ILoggers in this backend.
@@ -114,15 +106,18 @@ namespace DurableTask.Netherite
                     throw new NotImplementedException("no such transport choice");
             }
 
+            this.workItemTraceHelper = new WorkItemTraceHelper(loggerFactory, settings.WorkItemLogLevelLimit, this.StorageAccountName, this.Settings.HubName);
+
             if (this.configuredTransport != TransportConnectionString.TransportChoices.Memory)
                 this.LoadMonitorService = new AzureLoadMonitorTable(settings.StorageConnectionString, settings.LoadInformationAzureTableName, settings.HubName);
 
             this.Logger.LogInformation(
-                "trace generation limits: general={general} , transport={transport}, storage={storage}, events={events}; etwEnabled={etwEnabled}; core.IsTraceEnabled={core}",
+                "trace generation limits: general={general} , transport={transport}, storage={storage}, events={events}; workitems={workitems}; etwEnabled={etwEnabled}; core.IsTraceEnabled={core}",
                 settings.LogLevelLimit,
                 settings.TransportLogLevelLimit,
                 settings.StorageLogLevelLimit,
                 settings.EventLogLevelLimit,
+                settings.WorkItemLogLevelLimit,
                 EtwSource.Log.IsEnabled(),
                 DurableTask.Core.Tracing.DefaultEventSource.Log.IsTraceEnabled);
         }
@@ -230,7 +225,7 @@ namespace DurableTask.Netherite
                     this.Logger.LogWarning("NetheriteOrchestrationService lease timer on workerId={workerId} is running {delay}s behind schedule", this.Settings.WorkerId, delay);
 
                 if (!(this.LoadMonitorService is null))
-                    this.LoadPublisher = new LoadPublisher(this.LoadMonitorService, this.Logger);
+                    this.LoadPublisher = new LoadPublisher(this.LoadMonitorService, this.serviceShutdownSource.Token, this.Logger);
 
                 await this.taskHub.StartAsync().ConfigureAwait(false);
 
@@ -316,14 +311,14 @@ namespace DurableTask.Netherite
         {
             System.Diagnostics.Debug.Assert(this.client == null, "Backend should create only 1 client");
 
-            this.client = new Client(this, clientId, taskHubGuid, batchSender, this.serviceShutdownSource.Token);
+            this.client = new Client(this, clientId, taskHubGuid, batchSender, this.workItemTraceHelper, this.serviceShutdownSource.Token);
             return this.client;
         }
 
         TransportAbstraction.IPartition TransportAbstraction.IHost.AddPartition(uint partitionId, TransportAbstraction.ISender batchSender)
         {
             var partition = new Partition(this, partitionId, this.GetPartitionId, this.GetNumberPartitions, batchSender, this.Settings, this.StorageAccountName,
-                this.ActivityWorkItemQueue, this.OrchestrationWorkItemQueue, this.LoadPublisher);
+                this.ActivityWorkItemQueue, this.OrchestrationWorkItemQueue, this.LoadPublisher, this.workItemTraceHelper);
 
             return partition;
         }
@@ -514,8 +509,15 @@ namespace DurableTask.Netherite
             if (nextOrchestrationWorkItem != null) 
             {
                 nextOrchestrationWorkItem.MessageBatch.WaitingSince = null;
+
+                this.workItemTraceHelper.TraceWorkItemStarted(
+                    nextOrchestrationWorkItem.Partition.PartitionId, 
+                    WorkItemTraceHelper.WorkItemType.Orchestration,
+                    nextOrchestrationWorkItem.MessageBatch.WorkItemId,
+                    nextOrchestrationWorkItem.MessageBatch.InstanceId,
+                    nextOrchestrationWorkItem.Type.ToString());
             }
-         
+     
             return nextOrchestrationWorkItem;
         }
 
@@ -540,63 +542,99 @@ namespace DurableTask.Netherite
             // so we update it now.
             workItem.OrchestrationRuntimeState = newOrchestrationRuntimeState;
 
-            // all continue as new requests are processed immediately ("fast" continue-as-new)
+            // all continue as new requests are processed immediately (DurableTask.Core always uses "fast" continue-as-new)
             // so by the time we get here, it is not a continue as new
             partition.Assert(continuedAsNewMessage == null);
             partition.Assert(workItem.OrchestrationRuntimeState.OrchestrationStatus != OrchestrationStatus.ContinuedAsNew);
 
+            // we assign sequence numbers to all outgoing messages, to help us track them using unique message ids
+            long sequenceNumber = 0;
+
+            if (outboundMessages != null)
+            {
+                foreach(TaskMessage taskMessage in outboundMessages)
+                {
+                    taskMessage.SequenceNumber = sequenceNumber++;
+                }
+            }
+
             if (orchestratorMessages != null)
             {
-                foreach (var taskMessage in orchestratorMessages)
+                foreach (TaskMessage taskMessage in orchestratorMessages)
                 {
+                    taskMessage.SequenceNumber = sequenceNumber++;
                     if (partition.PartitionId == partition.PartitionFunction(taskMessage.OrchestrationInstance.InstanceId))
                     {
                         if (Entities.IsDelayedEntityMessage(taskMessage, out _))
                         {
-                            (timerMessages ?? (timerMessages = new List<TaskMessage>())).Add(taskMessage);
+                            (timerMessages ??= new List<TaskMessage>()).Add(taskMessage);
                         }
                         else if (taskMessage.Event is ExecutionStartedEvent executionStartedEvent && executionStartedEvent.ScheduledStartTime.HasValue)
                         {
-                            (timerMessages ?? (timerMessages = new List<TaskMessage>())).Add(taskMessage);
+                            (timerMessages ??= new List<TaskMessage>()).Add(taskMessage);
                         }
                         else
                         {
-                            (localMessages ?? (localMessages = new List<TaskMessage>())).Add(taskMessage);
+                            (localMessages ??= new List<TaskMessage>()).Add(taskMessage);
                         }
                     }
                     else
                     {
-                        (remoteMessages ?? (remoteMessages = new List<TaskMessage>())).Add(taskMessage);
+                        (remoteMessages ??= new List<TaskMessage>()).Add(taskMessage);
                     }
                 }
             }
 
+            if (timerMessages != null)
+            {
+                foreach (TaskMessage taskMessage in timerMessages)
+                {
+                    taskMessage.SequenceNumber = sequenceNumber++;
+                }
+            }
+
             // if this orchestration is not done, and extended sessions are enabled, we keep the work item so we can reuse the execution cursor
-            bool cacheWorkItemForReuse = partition.Settings.ExtendedSessionsEnabled && state.OrchestrationStatus == OrchestrationStatus.Running;           
+            bool cacheWorkItemForReuse = partition.Settings.ExtendedSessionsEnabled && state.OrchestrationStatus == OrchestrationStatus.Running;
+
+            BatchProcessed batchProcessedEvent = new BatchProcessed()
+            {
+                PartitionId = partition.PartitionId,
+                SessionId = messageBatch.SessionId,
+                InstanceId = workItem.InstanceId,
+                BatchStartPosition = messageBatch.BatchStartPosition,
+                BatchLength = messageBatch.BatchLength,
+                NewEvents = (List<HistoryEvent>)newOrchestrationRuntimeState.NewEvents,
+                WorkItemForReuse = cacheWorkItemForReuse ? orchestrationWorkItem : null,
+                State = state,
+                ActivityMessages = (List<TaskMessage>)outboundMessages,
+                LocalMessages = localMessages,
+                RemoteMessages = remoteMessages,
+                TimerMessages = (List<TaskMessage>)timerMessages,
+                Timestamp = DateTime.UtcNow,
+            };
+
+            this.workItemTraceHelper.TraceWorkItemCompleted(
+                partition.PartitionId,
+                WorkItemTraceHelper.WorkItemType.Orchestration,
+                messageBatch.WorkItemId,
+                workItem.InstanceId,
+                batchProcessedEvent.State.OrchestrationStatus,
+                WorkItemTraceHelper.FormatMessageIdList(batchProcessedEvent.TracedTaskMessages));
 
             try
             {
-                partition.SubmitInternalEvent(new BatchProcessed()
-                {
-                    PartitionId = partition.PartitionId,
-                    SessionId = messageBatch.SessionId,
-                    InstanceId = workItem.InstanceId,
-                    BatchStartPosition = messageBatch.BatchStartPosition,
-                    BatchLength = messageBatch.BatchLength,
-                    NewEvents = (List<HistoryEvent>)newOrchestrationRuntimeState.NewEvents,
-                    WorkItemForReuse = cacheWorkItemForReuse ? orchestrationWorkItem : null,
-                    State = state,
-                    ActivityMessages = (List<TaskMessage>)outboundMessages,
-                    LocalMessages = localMessages,
-                    RemoteMessages = remoteMessages,
-                    TimerMessages = (List<TaskMessage>)timerMessages,
-                    Timestamp = DateTime.UtcNow,
-                });
+                partition.SubmitInternalEvent(batchProcessedEvent);
             }
             catch(OperationCanceledException e)
             {
-                // we get here if the partition was terminated. The work is thrown away. It's unavoidable by design, but let's at least create a warning.
-                partition.ErrorHandler.HandleError(nameof(IOrchestrationService.CompleteTaskOrchestrationWorkItemAsync), "Canceling completed orchestration work item because of partition termination", e, false, true);
+                // we get here if the partition was terminated. The work is thrown away. 
+                // It's unavoidable by design, but let's at least create a warning.
+                partition.ErrorHandler.HandleError(
+                    nameof(IOrchestrationService.CompleteTaskOrchestrationWorkItemAsync), 
+                    "Canceling completed orchestration work item because of partition termination", 
+                    e, 
+                    false, 
+                    true);
             }
 
             return Task.CompletedTask;
@@ -612,7 +650,6 @@ namespace DurableTask.Netherite
             var newWorkItem = new OrchestrationWorkItem(orchestrationWorkItem.Partition, orchestrationWorkItem.MessageBatch, originalHistory);
             newWorkItem.Type = OrchestrationWorkItem.ExecutionType.ContinueFromHistory;
 
-            orchestrationWorkItem.Partition.EventTraceHelper.TraceOrchestrationWorkItemQueued(newWorkItem);
             orchestrationWorkItem.Partition.EnqueueOrchestrationWorkItem(newWorkItem);
 
             return Task.CompletedTask;
@@ -659,6 +696,17 @@ namespace DurableTask.Netherite
         async Task<TaskActivityWorkItem> IOrchestrationService.LockNextTaskActivityWorkItem(TimeSpan receiveTimeout, CancellationToken cancellationToken)
         {
             var nextActivityWorkItem = await this.ActivityWorkItemQueue.GetNext(receiveTimeout, cancellationToken).ConfigureAwait(false);
+
+            if (nextActivityWorkItem != null)
+            {
+                this.workItemTraceHelper.TraceWorkItemStarted(
+                    nextActivityWorkItem.Partition.PartitionId,
+                    WorkItemTraceHelper.WorkItemType.Activity,
+                    nextActivityWorkItem.WorkItemId,
+                    nextActivityWorkItem.TaskMessage.OrchestrationInstance.InstanceId,
+                    nextActivityWorkItem.ExecutionType);
+            }
+
             return nextActivityWorkItem;
         }
 
@@ -674,22 +722,38 @@ namespace DurableTask.Netherite
             var activityWorkItem = (ActivityWorkItem)workItem;
             var partition = activityWorkItem.Partition;
 
+            var activityCompletedEvent = new ActivityCompleted()
+            {
+                PartitionId = activityWorkItem.Partition.PartitionId,
+                ActivityId = activityWorkItem.ActivityId,
+                OriginPartitionId = activityWorkItem.OriginPartition,
+                ReportedLoad = this.ActivityWorkItemQueue.Load,
+                Timestamp = DateTime.UtcNow,
+                Response = responseMessage,
+            };
+
+            this.workItemTraceHelper.TraceWorkItemCompleted(
+                partition.PartitionId,
+                WorkItemTraceHelper.WorkItemType.Activity,
+                activityWorkItem.WorkItemId,
+                activityWorkItem.TaskMessage.OrchestrationInstance.InstanceId,
+                WorkItemTraceHelper.ActivityStatus.Completed,
+                WorkItemTraceHelper.FormatMessageId(responseMessage, activityWorkItem.WorkItemId));
+
             try
             {
-                partition.SubmitInternalEvent(new ActivityCompleted()
-                {
-                    PartitionId = activityWorkItem.Partition.PartitionId,
-                    ActivityId = activityWorkItem.ActivityId,
-                    OriginPartitionId = activityWorkItem.OriginPartition,
-                    ReportedLoad = this.ActivityWorkItemQueue.Load,
-                    Timestamp = DateTime.UtcNow,
-                    Response = responseMessage,
-                });
+                partition.SubmitInternalEvent(activityCompletedEvent);
             }
             catch (OperationCanceledException e)
             {
-                // we get here if the partition was terminated. The work is thrown away. It's unavoidable by design, but let's at least create a warning.
-                partition.ErrorHandler.HandleError(nameof(IOrchestrationService.CompleteTaskActivityWorkItemAsync), "Canceling completed activity work item because of partition termination", e, false, true);
+                // we get here if the partition was terminated. The work is thrown away. 
+                // It's unavoidable by design, but let's at least create a warning.
+                partition.ErrorHandler.HandleError(
+                    nameof(IOrchestrationService.CompleteTaskActivityWorkItemAsync), 
+                    "Canceling already-completed activity work item because of partition termination", 
+                    e, 
+                    false, 
+                    true);
             }
 
             return Task.CompletedTask;

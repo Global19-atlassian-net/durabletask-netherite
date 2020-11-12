@@ -1,15 +1,5 @@
-﻿//  ----------------------------------------------------------------------------------
-//  Copyright Microsoft Corporation. All rights reserved.
-//  Licensed under the Apache License, Version 2.0 (the "License");
-//  you may not use this file except in compliance with the License.
-//  You may obtain a copy of the License at
-//  http://www.apache.org/licenses/LICENSE-2.0
-//  Unless required by applicable law or agreed to in writing, software
-//  distributed under the License is distributed on an "AS IS" BASIS,
-//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//  See the License for the specific language governing permissions and
-//  limitations under the License.
-//  ----------------------------------------------------------------------------------
+﻿// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License. See LICENSE in the project root for license information.
 
 namespace DurableTask.Netherite
 {
@@ -26,7 +16,8 @@ namespace DurableTask.Netherite
     class TimersState : TrackedObject
     {
         [DataMember]
-        public Dictionary<long, (DateTime, TaskMessage)> PendingTimers { get; private set; } = new Dictionary<long, (DateTime, TaskMessage)>();
+        public Dictionary<long, (DateTime due, TaskMessage message, string workItemId)> PendingTimers { get; private set; } 
+            = new Dictionary<long, (DateTime, TaskMessage, string)>();
 
         [DataMember]
         public long SequenceNumber { get; set; }
@@ -44,7 +35,7 @@ namespace DurableTask.Netherite
             // restore the pending timers
             foreach (var kvp in this.PendingTimers)
             {
-                this.Schedule(kvp.Key, kvp.Value.Item1, kvp.Value.Item2);
+                this.Schedule(kvp.Key, kvp.Value.due, kvp.Value.message, kvp.Value.workItemId);
             }
         }
 
@@ -65,13 +56,14 @@ namespace DurableTask.Netherite
             }
         }
 
-        void Schedule(long timerId, DateTime due, TaskMessage message)
+        void Schedule(long timerId, DateTime due, TaskMessage message, string originWorkItemId)
         {
             TimerFired expirationEvent = new TimerFired()
             {
                 PartitionId = this.Partition.PartitionId,
                 TimerId = timerId,
                 TaskMessage = message,
+                OriginWorkItemId = originWorkItemId,
                 Due = due,
             };
 
@@ -112,11 +104,12 @@ namespace DurableTask.Netherite
             {
                 var timerId = this.SequenceNumber++;
                 var due = GetDueTime(t);
-                this.PendingTimers.Add(timerId, (due, t));
+                string workItemId = evt.EventIdString;
+                this.PendingTimers.Add(timerId, (due, t, workItemId));
 
                 if (!effects.IsReplaying)
                 {
-                    this.Schedule(timerId, due, t);
+                    this.Schedule(timerId, due, t, workItemId);
                 }
             }
         }
@@ -128,11 +121,11 @@ namespace DurableTask.Netherite
             {
                 var timerId = this.SequenceNumber++;
                 var due = GetDueTime(t);
-                this.PendingTimers.Add(timerId, (due, t));
+                this.PendingTimers.Add(timerId, (due, t, evt.WorkItemId));
 
                 if (!effects.IsReplaying)
                 {
-                    this.Schedule(timerId, due, t);
+                    this.Schedule(timerId, due, t, evt.WorkItemId);
                 }
             }
         }
@@ -142,11 +135,11 @@ namespace DurableTask.Netherite
             // starts a new timer for the execution started event
             var timerId = this.SequenceNumber++;
             var due = GetDueTime(creationRequestReceived.TaskMessage);
-            this.PendingTimers.Add(timerId, (due, creationRequestReceived.TaskMessage));
+            this.PendingTimers.Add(timerId, (due, creationRequestReceived.TaskMessage, creationRequestReceived.EventIdString));
 
             if (!effects.IsReplaying)
             {
-                this.Schedule(timerId, due, creationRequestReceived.TaskMessage);
+                this.Schedule(timerId, due, creationRequestReceived.TaskMessage, creationRequestReceived.WorkItemId);
             }
         }
     }

@@ -1,15 +1,5 @@
-﻿//  ----------------------------------------------------------------------------------
-//  Copyright Microsoft Corporation. All rights reserved.
-//  Licensed under the Apache License, Version 2.0 (the "License");
-//  you may not use this file except in compliance with the License.
-//  You may obtain a copy of the License at
-//  http://www.apache.org/licenses/LICENSE-2.0
-//  Unless required by applicable law or agreed to in writing, software
-//  distributed under the License is distributed on an "AS IS" BASIS,
-//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//  See the License for the specific language governing permissions and
-//  limitations under the License.
-//  ----------------------------------------------------------------------------------
+﻿// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License. See LICENSE in the project root for license information.
 
 namespace DurableTask.Netherite
 {
@@ -21,7 +11,7 @@ namespace DurableTask.Netherite
     using DurableTask.Core.History;
 
     [DataContract]
-class BatchProcessed : PartitionUpdateEvent
+    class BatchProcessed : PartitionUpdateEvent
     {
         [DataMember]
         public long SessionId { get; set; }
@@ -69,20 +59,39 @@ class BatchProcessed : PartitionUpdateEvent
         public override EventId EventId => EventId.MakePartitionInternalEventId(this.IsPersisted ? this.WorkItemId + "P" : this.WorkItemId);
 
         [IgnoreDataMember]
-        public override IEnumerable<TaskMessage> TracedTaskMessages 
+        public override IEnumerable<(TaskMessage,string)> TracedTaskMessages 
         { 
             get
             {
+                string workItemId = SessionsState.GetWorkItemId(this.PartitionId, this.SessionId, this.BatchStartPosition);
                 if (this.ActivityMessages != null)
-                    foreach (var a in this.ActivityMessages)
-                        yield return a;
+                {
+                    foreach (TaskMessage a in this.ActivityMessages)
+                    {
+                        yield return (a, workItemId);
+                    }
+                }
+                if (this.TimerMessages != null)
+                {
+                    foreach (TaskMessage t in this.TimerMessages)
+                    {
+                        yield return (t, workItemId);
+                    }
+                }
                 if (this.LocalMessages != null)
-                    foreach (var l in this.LocalMessages)
-                        yield return l;
+                {
+                    foreach (TaskMessage l in this.LocalMessages)
+                    {
+                        yield return (l, workItemId);
+                    }
+                }
                 if (this.RemoteMessages != null)
-                    foreach (var r in this.RemoteMessages)
-                        yield return r;
-                // we are not including the timer messages because they are considered "sent" at the time the timer fires, not when it is scheduled
+                {
+                    foreach (TaskMessage r in this.RemoteMessages)
+                    {
+                        yield return (r, workItemId);
+                    }
+                }
             }
         }
 

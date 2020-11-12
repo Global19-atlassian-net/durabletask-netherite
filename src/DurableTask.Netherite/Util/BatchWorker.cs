@@ -1,14 +1,5 @@
-﻿//  Copyright Microsoft Corporation. All rights reserved.
-//  Licensed under the Apache License, Version 2.0 (the "License");
-//  you may not use this file except in compliance with the License.
-//  You may obtain a copy of the License at
-//  http://www.apache.org/licenses/LICENSE-2.0
-//  Unless required by applicable law or agreed to in writing, software
-//  distributed under the License is distributed on an "AS IS" BASIS,
-//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//  See the License for the specific language governing permissions and
-//  limitations under the License.
-//  ----------------------------------------------------------------------------------
+﻿// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License. See LICENSE in the project root for license information.
 
 namespace DurableTask.Netherite
 {
@@ -42,19 +33,12 @@ namespace DurableTask.Netherite
         readonly object dummyEntry = new object();
 
         /// <summary>
-        /// Default constructor.
-        /// </summary>
-        public BatchWorker(string name) : this(name, CancellationToken.None)
-        {
-        }
-
-        /// <summary>
         /// Constructor including a cancellation token.
         /// </summary>
-        public BatchWorker(string name, CancellationToken cancellationToken, bool suspended = false)
+        public BatchWorker(string name, bool startSuspended, CancellationToken cancellationToken)
         {
             this.cancellationToken = cancellationToken;
-            this.state = suspended ? SUSPENDED : IDLE;
+            this.state = startSuspended ? SUSPENDED : IDLE;
             this.stopwatch = new Stopwatch();
         }
 
@@ -245,9 +229,13 @@ namespace DurableTask.Netherite
                 int currentState = this.state;
                 if (currentState == RUNNING)
                 {
-                    return;
+                    return; // worker is already running
                 }
-                else if (currentState == IDLE || (currentState == SUSPENDED && resume) || currentState == SHUTTINGDOWN)
+                else if (currentState == SUSPENDED && !resume)
+                {
+                    return; // we do not want to start processing yet
+                }
+                else 
                 {
                     int read = Interlocked.CompareExchange(ref this.state, RUNNING, currentState);
                     if (read == currentState)

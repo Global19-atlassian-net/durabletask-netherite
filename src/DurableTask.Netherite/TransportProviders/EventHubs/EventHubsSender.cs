@@ -1,14 +1,5 @@
-﻿//  Copyright Microsoft Corporation. All rights reserved.
-//  Licensed under the Apache License, Version 2.0 (the "License");
-//  you may not use this file except in compliance with the License.
-//  You may obtain a copy of the License at
-//  http://www.apache.org/licenses/LICENSE-2.0
-//  Unless required by applicable law or agreed to in writing, software
-//  distributed under the License is distributed on an "AS IS" BASIS,
-//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//  See the License for the specific language governing permissions and
-//  limitations under the License.
-//  ----------------------------------------------------------------------------------
+﻿// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License. See LICENSE in the project root for license information.
 
 namespace DurableTask.Netherite.EventHubs
 {
@@ -18,6 +9,7 @@ namespace DurableTask.Netherite.EventHubs
     using System;
     using System.Collections.Generic;
     using System.IO;
+    using System.Threading;
     using System.Threading.Tasks;
 
     class EventHubsSender<T> : BatchWorker<Event> where T: Event
@@ -34,7 +26,7 @@ namespace DurableTask.Netherite.EventHubs
         readonly MemoryStream stream = new MemoryStream(); // reused for all packets
 
         public EventHubsSender(TransportAbstraction.IHost host, byte[] taskHubGuid, PartitionSender sender, EventHubsTraceHelper traceHelper, bool useJsonPackets)
-            : base(nameof(EventHubsSender<T>))
+            : base(nameof(EventHubsSender<T>), false, CancellationToken.None)
         {
             this.host = host;
             this.taskHubGuid = taskHubGuid;
@@ -176,7 +168,7 @@ namespace DurableTask.Netherite.EventHubs
                     else
                     {
                         // the event may have been sent or maybe not, report problem to listener
-                        // this is used by clients who can give the exception back to the caller
+                        // this is used only on clients, who can give the exception back to the caller
                         DurabilityListeners.ReportException(evt, senderException);
                         dropped++;
                     }

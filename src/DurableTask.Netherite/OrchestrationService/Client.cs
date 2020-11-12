@@ -1,14 +1,5 @@
-﻿//  Copyright Microsoft Corporation. All rights reserved.
-//  Licensed under the Apache License, Version 2.0 (the "License");
-//  you may not use this file except in compliance with the License.
-//  You may obtain a copy of the License at
-//  http://www.apache.org/licenses/LICENSE-2.0
-//  Unless required by applicable law or agreed to in writing, software
-//  distributed under the License is distributed on an "AS IS" BASIS,
-//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//  See the License for the specific language governing permissions and
-//  limitations under the License.
-//  ----------------------------------------------------------------------------------
+﻿// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License. See LICENSE in the project root for license information.
 
 namespace DurableTask.Netherite
 {
@@ -29,6 +20,7 @@ namespace DurableTask.Netherite
         readonly ClientTraceHelper traceHelper;
         readonly string account;
         readonly Guid taskHubGuid;
+        readonly WorkItemTraceHelper workItemTraceHelper;
 
         static readonly TimeSpan DefaultTimeout = TimeSpan.FromMinutes(5);
 
@@ -43,12 +35,19 @@ namespace DurableTask.Netherite
 
         public static string GetShortId(Guid clientId) => clientId.ToString("N").Substring(0, 7);
 
-        public Client(NetheriteOrchestrationService host, Guid clientId, Guid taskHubGuid, TransportAbstraction.ISender batchSender, CancellationToken shutdownToken)
+        public Client(
+            NetheriteOrchestrationService host,
+            Guid clientId, 
+            Guid taskHubGuid, 
+            TransportAbstraction.ISender batchSender, 
+            WorkItemTraceHelper workItemTraceHelper,
+            CancellationToken shutdownToken)
         {
             this.host = host;
             this.ClientId = clientId;
             this.taskHubGuid = taskHubGuid;
             this.traceHelper = new ClientTraceHelper(host.Logger, host.Settings.LogLevelLimit, host.StorageAccountName, host.Settings.HubName, this.ClientId);
+            this.workItemTraceHelper = workItemTraceHelper;
             this.account = host.StorageAccountName;
             this.BatchSender = batchSender;
             this.shutdownToken = shutdownToken;
@@ -225,6 +224,14 @@ namespace DurableTask.Netherite
                 TimeoutUtc = this.GetTimeoutBucket(DefaultTimeout),
             };
 
+            this.workItemTraceHelper.TraceWorkItemCompleted(
+                partitionId,
+                WorkItemTraceHelper.WorkItemType.Client,
+                request.WorkItemId,
+                creationMessage.OrchestrationInstance.InstanceId,
+                WorkItemTraceHelper.ClientStatus.Create,
+                WorkItemTraceHelper.FormatMessageIdList(request.TracedTaskMessages));
+
             var response = await this.PerformRequestWithTimeoutAndCancellation(this.shutdownToken, request, false).ConfigureAwait(false);
             var creationResponseReceived = (CreationResponseReceived)response;
             if (!creationResponseReceived.Succeeded)
@@ -247,6 +254,25 @@ namespace DurableTask.Netherite
                 TaskMessages = messages.ToArray(),
                 TimeoutUtc = this.GetTimeoutBucket(DefaultTimeout),
             };
+
+            // we number the messages in this batch in order to create unique message ids for tracing purposes
+            int sequenceNumber = 0;
+            for(int i = 0; i < request.TaskMessages.Length; i++)
+            {
+                request.TaskMessages[i].SequenceNumber = sequenceNumber++;
+            }
+
+            // we create a separate trace message for each destination partition
+            foreach (var group in messages.GroupBy((message) => message.OrchestrationInstance.InstanceId))
+            {
+                this.workItemTraceHelper.TraceWorkItemCompleted(
+                    partitionId,
+                    WorkItemTraceHelper.WorkItemType.Client,
+                    request.WorkItemId,
+                    group.Key,
+                    WorkItemTraceHelper.ClientStatus.Send,
+                    WorkItemTraceHelper.FormatMessageIdList(group.Select((message) => (message, request.WorkItemId))));
+            }
 
             return this.PerformRequestWithTimeoutAndCancellation(this.shutdownToken, request, true);
         }
